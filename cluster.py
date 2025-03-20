@@ -344,7 +344,7 @@ class KubernetesCluster(BaseCluster):
                     gpu_memory = node['metadata']['labels']['nvidia.com/gpu.memory']
                     gpu_count = node['metadata']['labels']['nvidia.com/gpu.count']
                     mig = node['metadata']['labels']['nvidia.com/mig.capable']
-                    mig_profile = node['metadata']['labels'].get('nvidia.com/mig.config', '')
+                    mig_profile = node['metadata']['labels'].get('nvidia.com/mig.config', '').strip("'")
                     if 'GB' not in gpu_name:
                         gpu_name = gpu_name + '-{}GB'.format(int(gpu_memory) // 1024)
                     for _ in range(int(gpu_count)):
