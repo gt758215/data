@@ -274,10 +274,10 @@ class GpuResource(object):
             gb = int(self.memory) // (1024 * 8)
             profile_2_policy = {
                 "all-disabled": 0,
-                "all-3g.{}gb".format(4*gb): 1,
-                "all-2g.{}gb".format(2*gb): 2,
+                "all-3g.71gb": 1,
+                "all-2g.35gb": 2,
                 "all-balanced": 3,
-                "all-1g.{}gb".format(gb): 6
+                "all-1g.18gb": 6
             }
 
             if not self.mig_profile:
