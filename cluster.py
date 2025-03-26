@@ -95,14 +95,20 @@ class KubernetesCluster(BaseCluster):
         super().__init__(**kwargs)
         self.cluster_type = ClusterType.KUBERNETES
         self.cluster_configs = cluster_configs or {}
+        self.all_node_ready = False
 
     def init(self, **kwargs):
         if 'update_configs' in kwargs:
             self.save_credentials(update_configs=kwargs['update_configs'])  # validate & save
             self.cluster_configs.update(kwargs['update_configs'])
         nginx.reset(clean_up=False)
+        self.setup_clusterpolicy()
         self.setup_term_service()
         self.setup_nodes()
+
+    def setup_clusterpolicy(self):
+        self.k8s_tool.create_mig_configmap()
+        self.k8s_tool.patch_default_mig_config()
 
     def teardown_cluster(self, **kwargs):
         from mlsteam.core.host import host_delete, host_offline
@@ -282,35 +288,63 @@ class KubernetesCluster(BaseCluster):
             for c_hostid in cluster_hostids:
                 host_offline(c_hostid)
             raise
-
+        ready_node_count = 0
         cluster_node_hostids = set()
         for node in cluster_nodes:
             host_id = self.get_node_hostid(node['status']['nodeInfo']['machineID'])
 
             cluster_node_hostids.add(host_id)
             hostname = node['metadata']['labels'].get('kubernetes.io/hostname') or node['metadata']['name']
-            deploying_count = len(
-              [v for v in dict(filter(
-                lambda i: i[0].startswith("nvidia.com/gpu.deploy."),
+            nvidia_labels = dict(filter(
+                lambda i: i[0].startswith("nvidia.com/"),
                 node['metadata']['labels'].items()
-              )).values() if v not in ["true", "pre-installed"]]
-            )
-            mig_state = node['metadata']['labels'].get('nvidia.com/mig.config.state', 'success')
+            ))
+            deploying_validator_state = nvidia_labels.get('nvidia.com/gpu.deploy.operator-validator', 'true')
+            deploying_gfd_state = nvidia_labels.get('nvidia.com/gpu.deploy.gpu-feature-discovery', 'true')
+            mig_capable = nvidia_labels.get('nvidia.com/mig.capable', '')
+            mig_state = nvidia_labels.get('nvidia.com/mig.config.state', 'success')
+            mig_config = nvidia_labels.get('nvidia.com/mig.config', '')
             gpu_mig_count = sum(
               [int(v) for v in dict(filter(
                 lambda i: i[0].startswith("nvidia.com/"),
                 node['status']['allocatable'].items())).values()]
             )
-            if deploying_count or mig_state == 'pending':
-                logger.debug('[MIG] {} mig_pending: {} deploying_count: {}, gpu_mig_count: {}'.format(
-                    hostname, mig_state, deploying_count, gpu_mig_count))
-                host_offline(host_id)
+
+            # === Check GPU ready, set node to disconnected if not ready ===
+            deploying = deploying_validator_state != 'true' or deploying_gfd_state != 'true'
+            if not nvidia_labels:
+                # cpu nodes
+                pass
+            elif not mig_capable:
+                # deploying, have no label
                 continue
+            elif mig_capable == 'true':  # GPU with MIG
+                if deploying or mig_state not in ['success', 'failed']:
+                    logger.debug(
+                        '[GPU with MIG] {} operator-validator: {}, gpu-feature-discovery: {}, '
+                        'mig.config.state: {}, gpu_mig_count: {}'.format(
+                            hostname,
+                            deploying_validator_state,
+                            deploying_gfd_state,
+                            mig_state,
+                            gpu_mig_count,
+                        )
+                    )
+                    host_offline(host_id)
+                    continue
+            else:  # normal GPU or NO GPU
+                if deploying:
+                    logger.debug(
+                        '[GPU] {} operator-validator: {} gpu-feature-discovery: {}'.format(
+                            hostname,
+                            deploying_validator_state,
+                            deploying_gfd_state,
+                        )
+                    )
+                    host_offline(host_id)
+                    continue
+            # ================================================================
             host_ip = next((a['address'] for a in node['status']['addresses'] if a['type'] == 'InternalIP'), None)
-            nvidia_labels = dict(filter(
-                lambda i: i[0].startswith("nvidia.com/"),
-                node['metadata']['labels'].items()
-            ))
             resources = {
                 'ip': host_ip,
                 'hostname': hostname,
@@ -322,9 +356,9 @@ class KubernetesCluster(BaseCluster):
                 'roles': ['worker'],  # we do not distinguish between masters and slaves
                 'specs': {},
                 'nvidia.com': nvidia_labels,
-                'nvidia_driver': nvidia_labels.get("nvidia.com/cuda.driver-version.full"),
-                'nvidia_cuda': nvidia_labels.get("nvidia.com/cuda.runtime-version.full"),
-                'nvidia_mig_capable': nvidia_labels.get("nvidia.com/mig.capable"),
+                'nvidia_driver': nvidia_labels.get("nvidia.com/cuda.driver-version.full", ''),
+                'nvidia_cuda': nvidia_labels.get("nvidia.com/cuda.runtime-version.full", ''),
+                'nvidia_mig_capable': mig_capable,
                 'videos': [],
                 'platform': {
                     'machine': (node['metadata']['labels'].get('kubernetes.io/arch') or
@@ -334,54 +368,58 @@ class KubernetesCluster(BaseCluster):
                 }
             }
 
-            gpu_index = 0
             if 'nvidia.com/gpu' in node['status']['allocatable']:
                 if gpu_mig_count == 0:
+                    # 0 gpu on host but it has nvidia.com labels
                     continue
-                mig_off = int(node['metadata']['labels'].get('nvidia.com/gpu.replicas', 1)) >= 1
                 try:
-                    gpu_name = node['metadata']['labels']['nvidia.com/gpu.product']
-                    gpu_memory = node['metadata']['labels']['nvidia.com/gpu.memory']
-                    gpu_count = node['metadata']['labels']['nvidia.com/gpu.count']
-                    mig = node['metadata']['labels']['nvidia.com/mig.capable']
-                    mig_profile = node['metadata']['labels'].get('nvidia.com/mig.config', '').strip("'")
+                    gpu_index = 0
+                    gpu_count = int(nvidia_labels['nvidia.com/gpu.count'])
+                    gpu_name = nvidia_labels['nvidia.com/gpu.product']
+                    gpu_memory = nvidia_labels['nvidia.com/gpu.memory']
                     if 'GB' not in gpu_name:
                         gpu_name = gpu_name + '-{}GB'.format(int(gpu_memory) // 1024)
-                    for _ in range(int(gpu_count)):
+
+                    # MIG ==>
+                    mig_index = 0
+                    mig_devices = []
+                    for mig_key, mig_num in dict(filter(
+                        lambda i: i[0].startswith("nvidia.com/mig-"),
+                        node['status']['allocatable'].items()
+                    )).items():
+                        if int(mig_num) <= 0:
+                            continue
+                        mig_name = nvidia_labels[mig_key + '.product']
+                        mig_memory = nvidia_labels[mig_key + '.memory']
+                        mig_count = int(nvidia_labels[mig_key + '.count'])
+                        for _ in range(mig_count):
+                            mig_devices.append({
+                                'index': str(mig_index + gpu_count),
+                                'name': mig_name,
+                                'uuid': f'NV-MIG-{mig_index}',
+                                'memory': mig_memory,
+                                'mig': False,
+                                'categories': ['gpu.nvidia.mig'],
+                            })
+                            mig_index += 1
+                    # <==
+                    gpu_disable = len(mig_devices) > 0
+                    for _ in range(gpu_count):
                         resources['gpus'].append({
                             'index': str(gpu_index),
                             'name': gpu_name,
                             'uuid': f'NV-GPU-{gpu_index}',
                             'memory': gpu_memory,
-                            'mig': mig,
+                            'mig': mig_capable,
                             'categories': ['gpu.nvidia'],
-                            'disable': not mig_off,
-                            'mig_profile': mig_profile,
+                            'disable': gpu_disable,
+                            'mig_profile': mig_config,
                         })
                         gpu_index += 1
-                    if deploying_count:
-                        logger.debug("[MIG] {} MIG {}".format(hostname, ['OFF', 'ON'][int(mig_off)]))
-                    if not mig_off:
-                        for mig_name, mig_num in dict(filter(
-                          lambda i: i[0].startswith("nvidia.com/mig-"),
-                          node['status']['allocatable'].items()
-                        )).items():
-                            if int(mig_num) <= 0:
-                                continue
-                            gpu_name = node['metadata']['labels'][mig_name + '.product']
-                            gpu_memory = node['metadata']['labels'][mig_name + '.memory']
-                            gpu_count = node['metadata']['labels'][mig_name + '.count']
-                            for _ in range(int(gpu_count)):
-                                resources['gpus'].append({
-                                    'index': str(gpu_index),
-                                    'name': gpu_name,
-                                    'uuid': f'NV-MIG-{gpu_index}',
-                                    'memory': gpu_memory,
-                                    'mig': False,
-                                    'categories': ['gpu.nvidia.mig'],
-                                })
-                                gpu_index += 1
+                    resources['gpus'].extend(mig_devices)
                 except Exception:
+                    import traceback
+                    print(traceback.format_exc())
                     continue
             with self.CLUSTER_LOCK:
                 host_create(host_id, hostname, resources, authorize=True, skip_host_record=True)
@@ -394,6 +432,7 @@ class KubernetesCluster(BaseCluster):
                     host_online(host_id, joined_ok=True, suppress_log=True,
                                 k8s_allocatable=node['status']['allocatable'],
                                 k8s_conditions=node['status']['conditions'])
+                    ready_node_count += 1
                 else:
                     host_offline(host_id)
         with commit_on_close() as db_session:
@@ -403,6 +442,7 @@ class KubernetesCluster(BaseCluster):
             # hosts in db not listed by K8S server
             if c_hostid not in cluster_node_hostids:
                 host_offline(c_hostid)
+        self.all_node_ready = len(cluster_nodes) == ready_node_count
 
     def get_nodeport_ip(self) -> str | None:
         with RedisCache.open(f'manta.clusters.{self.cluster_uuid}.nodeport_ip') as cached:
